@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title='Ticker Advisor Pro+', page_icon='📈', layout='wide')
@@ -218,8 +219,44 @@ def get_history(symbol, period='1y'):
 
 @st.cache_data(ttl=1800)
 def get_ticker_data(symbol):
+    """Get lightweight ticker data without crashing on Yahoo rate limits.
+
+    We avoid failing hard on `Ticker.info`, which is the most common endpoint to be
+    rate-limited on Streamlit Cloud. The app can still work with price history and
+    news if quote fundamentals are temporarily unavailable.
+    """
     t = yf.Ticker(symbol)
-    info = t.info or {}
+    info = {'symbol': symbol, 'shortName': symbol}
+
+    # Best-effort lightweight fields from fast_info.
+    try:
+        fi = getattr(t, 'fast_info', None)
+        if fi:
+            try:
+                if fi.get('lastPrice') is not None:
+                    info['currentPrice'] = safe_float(fi.get('lastPrice'))
+            except Exception:
+                pass
+            try:
+                if fi.get('marketCap') is not None:
+                    info['marketCap'] = safe_float(fi.get('marketCap'))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Try full info, but gracefully degrade if Yahoo blocks the request.
+    try:
+        full_info = t.info or {}
+        if isinstance(full_info, dict):
+            info.update({k: v for k, v in full_info.items() if v is not None})
+            info['_rate_limited'] = False
+    except YFRateLimitError:
+        info['_rate_limited'] = True
+    except Exception:
+        info['_rate_limited'] = False
+
+    # News and calendar should also be best-effort only.
     try:
         news = t.news or []
     except Exception:
