@@ -1,7 +1,6 @@
 import math
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime
 from urllib.parse import quote_plus
 
 import numpy as np
@@ -11,846 +10,697 @@ import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="Ticker Advisor Pro", page_icon="📈", layout="wide")
+st.set_page_config(page_title='Ticker Advisor Pro+', page_icon='📈', layout='wide')
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+# ---------- Styling ----------
+st.markdown(
+    """
+    <style>
+    .metric-card {border:1px solid #2a2f3a; border-radius:14px; padding:14px; margin-bottom:10px;}
+    .small {font-size: 0.92rem; color: #c9d1d9;}
+    .tiny {font-size: 0.82rem; color: #9aa4b2;}
+    .good {color:#16a34a; font-weight:700;}
+    .bad {color:#dc2626; font-weight:700;}
+    .neutral {color:#d4a017; font-weight:700;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-
-# ---------- Indicators ----------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    macd_line = ema(series, 12) - ema(series, 26)
-    signal = ema(macd_line, 9)
-    hist = macd_line - signal
-    return macd_line, signal, hist
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-# ---------- Small utilities ----------
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def score_to_rating(score: float) -> tuple[int, str, str, str]:
-    rating = int(round(clamp(score, 0, 10)))
-    if rating >= 7:
-        return rating, "Green", "🟢", "good sign"
-    if rating <= 4:
-        return rating, "Red", "🔴", "bad sign"
-    return rating, "Yellow", "🟡", "neutral"
-
-
-def render_status_badge(color_name: str, text: str) -> str:
-    bg = {
-        "Green": "#0f5132",
-        "Yellow": "#7a5d00",
-        "Red": "#842029",
-    }.get(color_name, "#495057")
-    return f"<span style='background:{bg}; color:white; padding:6px 10px; border-radius:999px; font-weight:600;'>{text}</span>"
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
+# ---------- Utilities ----------
+def safe_float(v, default=np.nan):
     try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
+        if v is None:
             return default
-        return float(value)
+        if isinstance(v, (float, np.floating)) and np.isnan(v):
+            return default
+        return float(v)
     except Exception:
         return default
 
 
-def summarize_lines(lines: list[str], fallback: str) -> str:
-    clean = [x.strip() for x in lines if x and x.strip()]
-    return " ".join(clean[:2]) if clean else fallback
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
-# ---------- Pattern helpers ----------
-def detect_candle(df: pd.DataFrame) -> str:
+def badge(status: str) -> str:
+    colors = {
+        'Green': ('#052e16', '#22c55e'),
+        'Red': ('#450a0a', '#ef4444'),
+        'Yellow': ('#422006', '#f59e0b'),
+    }
+    bg, fg = colors.get(status, ('#1f2937', '#e5e7eb'))
+    return f"<span style='background:{bg}; color:{fg}; padding:4px 10px; border-radius:999px; font-weight:700;'>{status}</span>"
+
+
+def rating_to_status(score: float):
+    score = int(round(clamp(score, 1, 10)))
+    if score >= 7:
+        return score, 'Green'
+    if score <= 4:
+        return score, 'Red'
+    return score, 'Yellow'
+
+
+def keyword_score(text: str):
+    t = (text or '').lower()
+    pos = [
+        'beat', 'beats', 'upgrade', 'upgraded', 'buy', 'bullish', 'record', 'growth', 'partnership',
+        'investment', 'approved', 'surge', 'strong', 'rebound', 'launch', 'expansion', 'outperform'
+    ]
+    neg = [
+        'miss', 'downgrade', 'downgraded', 'sell', 'bearish', 'lawsuit', 'probe', 'cut', 'weak',
+        'decline', 'fall', 'drop', 'war', 'tariff', 'inflation', 'delay', 'recall', 'warns'
+    ]
+    score = 0
+    for w in pos:
+        score += t.count(w)
+    for w in neg:
+        score -= t.count(w)
+    return score
+
+
+def short_join(lines, max_items=4):
+    clean = [x.strip() for x in lines if x and str(x).strip()]
+    return ' '.join(clean[:max_items])
+
+
+# ---------- Indicators ----------
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def macd(series):
+    line = ema(series, 12) - ema(series, 26)
+    signal = ema(line, 9)
+    hist = line - signal
+    return line, signal, hist
+
+
+def stochastic(df, period=14, smooth=3):
+    low_min = df['Low'].rolling(period).min()
+    high_max = df['High'].rolling(period).max()
+    k = 100 * (df['Close'] - low_min) / (high_max - low_min).replace(0, np.nan)
+    d = k.rolling(smooth).mean()
+    return k, d
+
+
+def atr(df, period=14):
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - df['Close'].shift()).abs(),
+        (df['Low'] - df['Close'].shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def ichimoku(df):
+    high9 = df['High'].rolling(9).max()
+    low9 = df['Low'].rolling(9).min()
+    tenkan = (high9 + low9) / 2
+    high26 = df['High'].rolling(26).max()
+    low26 = df['Low'].rolling(26).min()
+    kijun = (high26 + low26) / 2
+    span_a = ((tenkan + kijun) / 2).shift(26)
+    high52 = df['High'].rolling(52).max()
+    low52 = df['Low'].rolling(52).min()
+    span_b = ((high52 + low52) / 2).shift(26)
+    return tenkan, kijun, span_a, span_b
+
+
+def detect_candle(df):
     if len(df) < 2:
-        return "Not enough data"
+        return 'Not enough data'
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
-    body = abs(last["Close"] - last["Open"])
-    full = max(last["High"] - last["Low"], 1e-9)
-    lower_wick = min(last["Open"], last["Close"]) - last["Low"]
-    upper_wick = last["High"] - max(last["Open"], last["Close"])
-
-    if last["Close"] > last["Open"] and prev["Close"] < prev["Open"]:
-        if last["Open"] <= prev["Close"] and last["Close"] >= prev["Open"]:
-            return "Bullish engulfing"
-    if last["Close"] < last["Open"] and prev["Close"] > prev["Open"]:
-        if last["Open"] >= prev["Close"] and last["Close"] <= prev["Open"]:
-            return "Bearish engulfing"
-    if lower_wick > body * 2 and upper_wick < max(body, 0.01):
-        return "Hammer-like"
-    if upper_wick > body * 2 and lower_wick < max(body, 0.01):
-        return "Shooting-star-like"
+    body = abs(last['Close'] - last['Open'])
+    full = max(last['High'] - last['Low'], 1e-9)
+    lower = min(last['Open'], last['Close']) - last['Low']
+    upper = last['High'] - max(last['Open'], last['Close'])
+    if last['Close'] > last['Open'] and prev['Close'] < prev['Open'] and last['Close'] >= prev['Open'] and last['Open'] <= prev['Close']:
+        return 'Bullish engulfing'
+    if last['Close'] < last['Open'] and prev['Close'] > prev['Open'] and last['Close'] <= prev['Open'] and last['Open'] >= prev['Close']:
+        return 'Bearish engulfing'
+    if lower > body * 2 and upper < max(body, 0.01):
+        return 'Hammer-like'
+    if upper > body * 2 and lower < max(body, 0.01):
+        return 'Shooting-star-like'
     if body / full < 0.15:
-        return "Doji-like"
-    return "No major single-candle signal"
+        return 'Doji-like'
+    return 'No major candle signal'
 
 
-def detect_pattern(df: pd.DataFrame) -> str:
-    if len(df) < 30:
-        return "Not enough data"
-    recent = df.tail(20)
-    close = recent["Close"]
-    high = recent["High"]
-    low = recent["Low"]
-
-    if close.iloc[-1] > high.iloc[:-1].max():
-        return "Breakout above 20-day range"
-    if close.iloc[-1] < low.iloc[:-1].min():
-        return "Breakdown below 20-day range"
-
-    range_pct = (high.max() - low.min()) / max(close.mean(), 1e-9)
-    slope = np.polyfit(range(len(close)), close.values, 1)[0]
-    if range_pct < 0.06 and slope > 0:
-        return "Tight bullish consolidation"
-    if range_pct < 0.06 and slope < 0:
-        return "Tight bearish consolidation"
-    return "No clear simple pattern"
+def pivot_levels(df):
+    prev = df.iloc[-2]
+    p = (prev['High'] + prev['Low'] + prev['Close']) / 3
+    r1 = 2 * p - prev['Low']
+    s1 = 2 * p - prev['High']
+    r2 = p + (prev['High'] - prev['Low'])
+    s2 = p - (prev['High'] - prev['Low'])
+    return p, s1, s2, r1, r2
 
 
-# ---------- External data ----------
-def get_finnhub_key() -> str:
-    try:
-        return st.secrets.get("FINNHUB_API_KEY", "").strip()
-    except Exception:
-        return ""
+def nearest_liquidity_levels(df, last_close):
+    closes = df['Close'].tail(120)
+    rounded = closes.round(0)
+    counts = rounded.value_counts().sort_index()
+    if counts.empty:
+        return []
+    nearby = counts.loc[(counts.index >= last_close - 20) & (counts.index <= last_close + 20)]
+    top = nearby.sort_values(ascending=False).head(4)
+    return [float(x) for x in sorted(top.index.tolist())]
 
 
-def get_finnhub_json(endpoint: str, params: dict[str, Any]) -> Any:
-    key = get_finnhub_key()
-    if not key:
-        return None
-    base = f"https://finnhub.io/api/v1/{endpoint}"
-    payload = dict(params)
-    payload["token"] = key
-    try:
-        resp = requests.get(base, params=payload, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception:
-        return None
+def price_volume_orderflow_proxy(df):
+    recent = df.tail(10).copy()
+    signed = np.where(recent['Close'] >= recent['Open'], recent['Volume'], -recent['Volume'])
+    ratio = signed.sum() / max(recent['Volume'].sum(), 1)
+    if ratio > 0.15:
+        return 'Net buying pressure', 7.5
+    if ratio < -0.15:
+        return 'Net selling pressure', 3.5
+    return 'Balanced / mixed flow', 5.5
 
 
-@st.cache_data(ttl=1800)
-def get_market_history(symbol: str, period: str = "1y") -> pd.DataFrame:
-    hist = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = hist.columns.get_level_values(0)
-    return hist.dropna(how="all")
-
-
-def market_trend(symbol: str) -> str:
-    data = get_market_history(symbol, period="6mo")
-    if data.empty or len(data) < 50:
-        return "Unknown"
-    close = data["Close"]
+def trend_of(df):
+    if len(df) < 50:
+        return 'Unknown'
+    close = df['Close']
     sma20 = close.rolling(20).mean().iloc[-1]
     sma50 = close.rolling(50).mean().iloc[-1]
     last = close.iloc[-1]
     if last > sma20 > sma50:
-        return "Up"
+        return 'Up'
     if last < sma20 < sma50:
-        return "Down"
-    return "Mixed"
+        return 'Down'
+    return 'Mixed'
 
 
-@st.cache_data(ttl=3600)
-def get_google_news(query: str, limit: int = 6) -> list[dict[str, str]]:
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
-    items: list[dict[str, str]] = []
+# ---------- Data ----------
+@st.cache_data(ttl=1800)
+def get_history(symbol, period='1y'):
+    df = yf.download(symbol, period=period, interval='1d', auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna(how='all')
+
+
+@st.cache_data(ttl=1800)
+def get_ticker_data(symbol):
+    t = yf.Ticker(symbol)
+    info = t.info or {}
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "xml")
-        for item in soup.find_all("item")[:limit]:
-            items.append(
-                {
-                    "title": item.title.text if item.title else "Untitled",
-                    "link": item.link.text if item.link else "",
-                    "publisher": item.source.text if item.source else "Google News",
-                    "pubDate": item.pubDate.text if item.pubDate else "",
-                }
-            )
+        news = t.news or []
     except Exception:
-        return []
-    return items
+        news = []
+    try:
+        calendar = t.calendar
+    except Exception:
+        calendar = None
+    return info, news, calendar
 
 
 @st.cache_data(ttl=3600)
-def get_insider_dashboard_summary(ticker: str) -> dict[str, Any]:
-    url = f"https://www.insiderdashboard.com/search?query={ticker}"
-    result: dict[str, Any] = {
-        "status": "Unavailable",
-        "summary": "Could not read Insider Dashboard.",
-        "filings": [],
-        "url": url,
-    }
+def google_news_search(query, limit=6):
+    url = f'https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en'
+    out = []
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        text = resp.text
-        soup = BeautifulSoup(text, "html.parser")
-        plain = soup.get_text(" ", strip=True)
-
-        if "No insider transaction data found" in plain:
-            result["status"] = "Neutral"
-            result["summary"] = "No insider transaction data found on Insider Dashboard."
-            return result
-
-        if "No insider buys found" in plain:
-            result["status"] = "Red"
-            result["summary"] = "No insider buys found on Insider Dashboard."
-
-        filings: list[dict[str, str]] = []
-        current_form = None
-        current_date = None
-        current_score = None
-        for line in [x.strip() for x in soup.get_text("\n").splitlines() if x.strip()]:
-            if line == "Form 4":
-                current_form = line
-                continue
-            if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", line):
-                current_date = line
-                continue
-            if re.fullmatch(r"\d{1,3}", line):
-                val = int(line)
-                if 0 <= val <= 100:
-                    current_score = f"{val}%"
-                    continue
-            if line.startswith("Summary:"):
-                summary = line.replace("Summary:", "").strip()
-                filings.append(
-                    {
-                        "form": current_form or "Form 4",
-                        "date": current_date or "",
-                        "impact": current_score or "",
-                        "summary": summary,
-                    }
-                )
-                current_form = None
-                current_date = None
-                current_score = None
-                if len(filings) >= 3:
-                    break
-
-        if filings:
-            result["filings"] = filings
-            joined = " ".join([f"{f['date']}: {f['summary']}" for f in filings[:2]])
-            result["summary"] = joined
-            if any("buy" in f["summary"].lower() for f in filings):
-                result["status"] = "Green"
-            elif any("award" in f["summary"].lower() or "rsu" in f["summary"].lower() for f in filings):
-                result["status"] = result["status"] if result["status"] != "Unavailable" else "Yellow"
-            else:
-                result["status"] = result["status"] if result["status"] != "Unavailable" else "Yellow"
-        elif result["status"] == "Unavailable":
-            result["summary"] = "Insider Dashboard page loaded, but no easy public filing summary was parsed."
-
-    except Exception as exc:
-        result["summary"] = f"Insider Dashboard fetch failed: {exc}"
-
-    return result
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'xml')
+        for item in soup.find_all('item')[:limit]:
+            out.append({
+                'title': item.title.text if item.title else '',
+                'link': item.link.text if item.link else '',
+                'source': item.source.text if item.source else '',
+                'date': item.pubDate.text if item.pubDate else '',
+            })
+    except Exception:
+        pass
+    return out
 
 
-# ---------- Scoring / levels ----------
-def compute_support_resistance(hist: pd.DataFrame, price: float, atr14: float) -> dict[str, float]:
-    recent = hist.tail(30)
-    highs = recent["High"]
-    lows = recent["Low"]
-
-    recent_highs = sorted(set(round(x, 2) for x in highs.nlargest(5).tolist()))
-    recent_lows = sorted(set(round(x, 2) for x in lows.nsmallest(5).tolist()))
-
-    resistance_candidates = [x for x in recent_highs if x > price]
-    support_candidates = [x for x in recent_lows if x < price]
-
-    r1 = resistance_candidates[0] if resistance_candidates else round(price + atr14, 2)
-    r2 = resistance_candidates[1] if len(resistance_candidates) > 1 else round(r1 + atr14 * 0.8, 2)
-    s1 = support_candidates[-1] if support_candidates else round(price - atr14, 2)
-    s2 = support_candidates[-2] if len(support_candidates) > 1 else round(s1 - atr14 * 0.8, 2)
-
-    return {"s1": s1, "s2": s2, "r1": r1, "r2": r2}
-
-
-def analyze_section_scores(
-    ticker: str,
-    price: float,
-    hist: pd.DataFrame,
-    rsi14: float,
-    macd_value: float,
-    macd_signal: float,
-    rel_volume: float,
-    candle: str,
-    pattern: str,
-    trend: str,
-    spy: str,
-    qqq: str,
-    dxy: str,
-    tnx: str,
-    vix: float,
-    analyst_text: str,
-    analyst_counts: dict[str, int] | None,
-    insider_data: dict[str, Any],
-    political_news: list[dict[str, str]],
-    economic_news: list[dict[str, str]],
-    company_news: list[dict[str, str]],
-) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
-
-    # Macro & Political
-    macro_score = 5.0
-    macro_notes: list[str] = []
-    if vix and vix < 16:
-        macro_score += 1.5
-        macro_notes.append(f"VIX is calm at about {vix:.1f}.")
-    elif vix and vix > 22:
-        macro_score -= 1.5
-        macro_notes.append(f"VIX is elevated at about {vix:.1f}.")
-    if dxy == "Down":
-        macro_score += 1.0
-        macro_notes.append("DXY is weakening, which is usually a mild tailwind for risk assets.")
-    elif dxy == "Up":
-        macro_score -= 1.0
-        macro_notes.append("DXY is rising, which can pressure risk assets.")
-    if tnx == "Down":
-        macro_score += 1.0
-        macro_notes.append("10Y yield trend is down, which helps growth names.")
-    elif tnx == "Up":
-        macro_score -= 1.0
-        macro_notes.append("10Y yield trend is up, which can be a headwind.")
-    if political_news:
-        macro_notes.append(f"Political headline: {political_news[0]['title']}")
-    if economic_news:
-        macro_notes.append(f"Economic headline: {economic_news[0]['title']}")
-    rating, color, emoji, meaning = score_to_rating(macro_score)
-    sections.append(
-        {
-            "section": "Macro & Political",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(macro_notes, "Macro backdrop is mixed."),
-            "details": macro_notes,
-        }
-    )
-
-    # Market context
-    market_score = 5.0
-    market_notes: list[str] = []
-    if spy == "Up":
-        market_score += 1.5
-        market_notes.append("SPY trend is up.")
-    elif spy == "Down":
-        market_score -= 1.5
-        market_notes.append("SPY trend is down.")
-    if qqq == "Up":
-        market_score += 1.0
-        market_notes.append("QQQ trend is up.")
-    elif qqq == "Down":
-        market_score -= 1.0
-        market_notes.append("QQQ trend is down.")
-    if company_news:
-        market_notes.append(f"Company/news context: {company_news[0]['title']}")
-    rating, color, emoji, meaning = score_to_rating(market_score)
-    sections.append(
-        {
-            "section": "Market Context",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(market_notes, "Market context is mixed."),
-            "details": market_notes,
-        }
-    )
-
-    # Stock trend
-    trend_score = 5.0
-    trend_notes: list[str] = []
-    sma20 = safe_float(hist["Close"].rolling(20).mean().iloc[-1])
-    sma50 = safe_float(hist["Close"].rolling(50).mean().iloc[-1])
-    sma100 = safe_float(hist["Close"].rolling(100).mean().iloc[-1])
-    sma200 = safe_float(hist["Close"].rolling(200).mean().iloc[-1]) if len(hist) >= 200 else sma100
-    wk52_high = safe_float(hist["High"].tail(252).max())
-    wk52_low = safe_float(hist["Low"].tail(252).min())
-    if trend == "Uptrend":
-        trend_score += 2.0
-        trend_notes.append("Price is above short-term moving averages in an uptrend.")
-    elif trend == "Downtrend":
-        trend_score -= 2.0
-        trend_notes.append("Price is below key moving averages in a downtrend.")
-    else:
-        trend_notes.append("Trend is mixed, not fully aligned.")
-    trend_notes.append(f"52-week range is about ${wk52_low:.2f} to ${wk52_high:.2f}.")
-    trend_notes.append(f"Price vs SMAs: 20D ${sma20:.2f}, 50D ${sma50:.2f}, 100D ${sma100:.2f}, 200D ${sma200:.2f}.")
-    rating, color, emoji, meaning = score_to_rating(trend_score)
-    sections.append(
-        {
-            "section": "Stock Trend",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(trend_notes, "Trend is mixed."),
-            "details": trend_notes,
-        }
-    )
-
-    # Technical analysis
-    technical_score = 5.0
-    technical_notes: list[str] = []
-    if 50 <= rsi14 <= 68:
-        technical_score += 2.0
-        technical_notes.append(f"RSI is constructive at {rsi14:.2f}.")
-    elif rsi14 > 70:
-        technical_score -= 1.5
-        technical_notes.append(f"RSI is overbought at {rsi14:.2f}.")
-    elif rsi14 < 35:
-        technical_score -= 1.5
-        technical_notes.append(f"RSI is weak at {rsi14:.2f}.")
-    else:
-        technical_notes.append(f"RSI is neutral at {rsi14:.2f}.")
-    if macd_value > macd_signal:
-        technical_score += 1.5
-        technical_notes.append(f"MACD is bullish ({macd_value:.2f} above {macd_signal:.2f}).")
-    else:
-        technical_score -= 1.5
-        technical_notes.append(f"MACD is bearish ({macd_value:.2f} below {macd_signal:.2f}).")
-    technical_notes.append(f"Candle: {candle}. Pattern: {pattern}.")
-    rating, color, emoji, meaning = score_to_rating(technical_score)
-    sections.append(
-        {
-            "section": "Technical Analysis",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(technical_notes, "Technicals are mixed."),
-            "details": technical_notes,
-        }
-    )
-
-    # Volume & smart money
-    volume_score = 5.0
-    volume_notes: list[str] = []
-    avg30 = safe_float(hist["Volume"].tail(30).mean())
-    if rel_volume >= 1.2:
-        volume_score += 1.5
-        volume_notes.append(f"Volume is strong at {hist['Volume'].iloc[-1] / 1_000_000:.2f}M vs 30-day average {avg30 / 1_000_000:.2f}M.")
-    elif rel_volume < 0.8:
-        volume_score -= 1.0
-        volume_notes.append("Volume is below normal, so conviction is weaker.")
-    else:
-        volume_notes.append("Volume is near average.")
-    if price > hist["Close"].tail(10).mean():
-        volume_notes.append("Recent price action is holding above short-term average, which supports the move.")
-    rating, color, emoji, meaning = score_to_rating(volume_score)
-    sections.append(
-        {
-            "section": "Volume & Smart Money",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(volume_notes, "Volume profile is average."),
-            "details": volume_notes,
-        }
-    )
-
-    # Insider / whale
-    insider_score = 5.0
-    insider_notes: list[str] = []
-    status = insider_data.get("status", "Unavailable")
-    insider_notes.append(insider_data.get("summary", "No insider summary available."))
-    if status == "Green":
-        insider_score += 2.0
-    elif status == "Red":
-        insider_score -= 1.5
-    if analyst_counts:
-        insider_notes.append(f"Analyst mix: Buy {analyst_counts.get('buy', 0)}, Hold {analyst_counts.get('hold', 0)}, Sell {analyst_counts.get('sell', 0)}.")
-    rating, color, emoji, meaning = score_to_rating(insider_score)
-    sections.append(
-        {
-            "section": "Insider / Whale Activity",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(insider_notes, "Insider data is limited."),
-            "details": insider_notes,
-        }
-    )
-
-    # Sentiment / analysts
-    sentiment_score = 5.0
-    sentiment_notes: list[str] = []
-    if analyst_counts:
-        buy = analyst_counts.get("buy", 0)
-        sell = analyst_counts.get("sell", 0)
-        hold = analyst_counts.get("hold", 0)
-        if buy > sell:
-            sentiment_score += 2.0
-            sentiment_notes.append(f"Analysts lean positive: {analyst_text}.")
-        elif sell > buy:
-            sentiment_score -= 2.0
-            sentiment_notes.append(f"Analysts lean negative: {analyst_text}.")
-        else:
-            sentiment_notes.append(f"Analyst view is balanced: {analyst_text}.")
-    else:
-        sentiment_notes.append("No live analyst recommendation feed was available.")
-    if company_news:
-        sentiment_notes.append(f"Latest company headline: {company_news[0]['title']}")
-    rating, color, emoji, meaning = score_to_rating(sentiment_score)
-    sections.append(
-        {
-            "section": "Sentiment & Analysts",
-            "score": rating,
-            "color": color,
-            "emoji": emoji,
-            "meaning": meaning,
-            "summary": summarize_lines(sentiment_notes, "Sentiment is mixed."),
-            "details": sentiment_notes,
-        }
-    )
-
-    return sections
-
-
-@st.cache_data(ttl=900)
-def analyze_ticker(ticker: str) -> dict[str, Any]:
-    ticker = ticker.upper().strip()
-    if not ticker:
-        raise ValueError("Please enter a ticker.")
-
-    tk = yf.Ticker(ticker)
-    hist = tk.history(period="1y", interval="1d", auto_adjust=True)
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = hist.columns.get_level_values(0)
-    hist = hist.dropna(how="all")
-
-    if hist.empty or len(hist) < 60:
-        raise ValueError(f"Not enough data found for {ticker}.")
-
-    info = tk.fast_info or {}
-    close = hist["Close"]
-    volume = hist["Volume"]
-
-    price = float(close.iloc[-1])
-    sma20 = float(close.rolling(20).mean().iloc[-1])
-    sma50 = float(close.rolling(50).mean().iloc[-1])
-    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float(close.rolling(50).mean().iloc[-1])
-    rsi14 = float(rsi(close).iloc[-1])
-    macd_line, signal_line, hist_line = macd(close)
-    atr14 = float(atr(hist).iloc[-1])
-    rel_volume = float(volume.iloc[-1] / max(volume.tail(50).mean(), 1))
-    candle = detect_candle(hist)
-    pattern = detect_pattern(hist)
-
-    trend = "Uptrend" if price > sma20 > sma50 else "Downtrend" if price < sma20 < sma50 else "Mixed"
-
-    spy = market_trend("SPY")
-    qqq = market_trend("QQQ")
-    dxy = market_trend("DX-Y.NYB")
-    tnx = market_trend("^TNX")
-    vix_hist = get_market_history("^VIX", period="3mo")
-    vix = safe_float(vix_hist["Close"].iloc[-1]) if not vix_hist.empty else 0.0
-
-    # News buckets
-    company_news: list[dict[str, str]] = []
-    for item in (tk.news or [])[:6]:
-        title = item.get("title") or item.get("content", {}).get("title") or "Untitled"
-        link = item.get("link") or item.get("content", {}).get("canonicalUrl", {}).get("url") or ""
-        publisher = item.get("publisher") or item.get("content", {}).get("provider", {}).get("displayName") or "Source"
-        company_news.append({"title": title, "publisher": publisher, "link": link})
-
-    political_news = get_google_news("US politics stock market tariff geopolitical", 4)
-    economic_news = get_google_news("Federal Reserve CPI jobs report stock market", 4)
-    if not company_news:
-        company_news = get_google_news(f"{ticker} stock company news", 5)
-
-    # Analysts
-    analyst_text = "Unavailable"
-    analyst_count_summary = None
-    finnhub_rec = get_finnhub_json("stock/recommendation", {"symbol": ticker})
-    if isinstance(finnhub_rec, list) and finnhub_rec:
-        latest = finnhub_rec[0]
-        buy = int(latest.get("buy", 0) or 0)
-        hold = int(latest.get("hold", 0) or 0)
-        sell = int(latest.get("sell", 0) or 0)
-        analyst_count_summary = {"buy": buy, "hold": hold, "sell": sell}
-        analyst_text = f"Buy {buy} / Hold {hold} / Sell {sell}"
-
-    insider_dashboard = get_insider_dashboard_summary(ticker)
-
-    sections = analyze_section_scores(
-        ticker=ticker,
-        price=price,
-        hist=hist,
-        rsi14=rsi14,
-        macd_value=float(macd_line.iloc[-1]),
-        macd_signal=float(signal_line.iloc[-1]),
-        rel_volume=rel_volume,
-        candle=candle,
-        pattern=pattern,
-        trend=trend,
-        spy=spy,
-        qqq=qqq,
-        dxy=dxy,
-        tnx=tnx,
-        vix=vix,
-        analyst_text=analyst_text,
-        analyst_counts=analyst_count_summary,
-        insider_data=insider_dashboard,
-        political_news=political_news,
-        economic_news=economic_news,
-        company_news=company_news,
-    )
-
-    total_score = sum(s["score"] for s in sections)
-    max_score = len(sections) * 10
-    pass_threshold = 52
-
-    levels = compute_support_resistance(hist, price, atr14)
-
-    # Entry / exit logic
-    if total_score >= 58:
-        recommendation = "BUY"
-        entry_zone = f"${levels['s1']:.2f}-${min(price, levels['r1']):.2f} on pullback or reclaim"
-        stop = round(levels["s2"] - atr14 * 0.25, 2)
-        target1 = round(levels["r1"], 2)
-        target2 = round(levels["r2"], 2)
-        recommendation_note = "Constructive setup, but still wait for price to hold support or confirm the breakout."
-    elif total_score <= 38:
-        recommendation = "SELL / AVOID"
-        entry_zone = f"${levels['r1']:.2f}-${levels['r2']:.2f} on failed bounce / rejection"
-        stop = round(levels["r2"] + atr14 * 0.25, 2)
-        target1 = round(levels["s1"], 2)
-        target2 = round(levels["s2"], 2)
-        recommendation_note = "Setup is weak or extended. Better to avoid longs or only consider a short on a failed bounce."
-    else:
-        recommendation = "NO ACTION / WATCH"
-        entry_zone = f"Wait for move through ${levels['r1']:.2f} or pullback toward ${levels['s1']:.2f}"
-        stop = round(levels["s2"] - atr14 * 0.25, 2)
-        target1 = round(levels["r1"], 2)
-        target2 = round(levels["r2"], 2)
-        recommendation_note = "Mixed setup. Let the stock prove direction first."
-
-    entry_ref = (levels["s1"] + min(price, levels["r1"])) / 2 if recommendation == "BUY" else price
-    rr = abs((target1 - entry_ref) / max(abs(entry_ref - stop), 1e-9))
-
-    quote_type = info.get("quoteType")
-    exchange = info.get("exchange")
-    chart_hint = f"https://www.tradingview.com/search/?query={ticker}"
-    if quote_type == "EQUITY" and exchange in {"NMS", "NAS", "NASDAQ"}:
-        chart_hint = f"https://www.tradingview.com/symbols/NASDAQ-{ticker}/"
-    elif quote_type == "EQUITY" and exchange in {"NYQ", "NYE", "NYSE"}:
-        chart_hint = f"https://www.tradingview.com/symbols/NYSE-{ticker}/"
-
-    return {
-        "ticker": ticker,
-        "long_name": info.get("longName") or ticker,
-        "price": price,
-        "trend": trend,
-        "sma20": sma20,
-        "sma50": sma50,
-        "sma200": sma200,
-        "rsi": rsi14,
-        "macd": float(macd_line.iloc[-1]),
-        "macd_signal": float(signal_line.iloc[-1]),
-        "atr": atr14,
-        "rel_volume": rel_volume,
-        "candle": candle,
-        "pattern": pattern,
-        "spy": spy,
-        "qqq": qqq,
-        "dxy": dxy,
-        "tnx": tnx,
-        "vix": vix,
-        "analyst": analyst_text,
-        "analyst_counts": analyst_count_summary,
-        "insider_dashboard": insider_dashboard,
-        "political_news": political_news,
-        "economic_news": economic_news,
-        "company_news": company_news,
-        "sections": sections,
-        "total_score": total_score,
-        "max_score": max_score,
-        "pass_threshold": pass_threshold,
-        "recommendation": recommendation,
-        "recommendation_note": recommendation_note,
-        "entry_zone": entry_zone,
-        "support1": levels["s1"],
-        "support2": levels["s2"],
-        "resistance1": levels["r1"],
-        "resistance2": levels["r2"],
-        "stop": stop,
-        "target1": target1,
-        "target2": target2,
-        "rr": rr,
-        "sources": {
-            "Yahoo Finance": f"https://finance.yahoo.com/quote/{ticker}",
-            "TradingView": chart_hint,
-            "Insider Dashboard": insider_dashboard["url"],
-            "SEC filings": f"https://www.sec.gov/edgar/search/#/q={ticker}",
-        },
+@st.cache_data(ttl=3600)
+def get_macro_news():
+    queries = {
+        'MarketWatch': 'stock market macro political economy site:marketwatch.com',
+        'CNBC': 'stock market macro political economy site:cnbc.com',
+        'Yahoo Finance': 'stock market macro political economy site:finance.yahoo.com',
     }
+    bundle = {}
+    for name, q in queries.items():
+        bundle[name] = google_news_search(q, limit=3)
+    return bundle
+
+
+@st.cache_data(ttl=3600)
+def get_ticker_context_news(ticker):
+    queries = {
+        'MarketWatch': f'{ticker} company earnings ceo guidance investment site:marketwatch.com',
+        'CNBC': f'{ticker} company earnings ceo guidance investment site:cnbc.com',
+        'Yahoo Finance': f'{ticker} company earnings ceo guidance investment site:finance.yahoo.com',
+    }
+    bundle = {}
+    for name, q in queries.items():
+        bundle[name] = google_news_search(q, limit=3)
+    return bundle
+
+
+@st.cache_data(ttl=3600)
+def get_social_mentions(ticker):
+    sites = {
+        'X': 'x.com',
+        'Reddit': 'reddit.com',
+        'Quora': 'quora.com',
+        'Facebook': 'facebook.com',
+    }
+    out = {}
+    for label, domain in sites.items():
+        out[label] = google_news_search(f'{ticker} stock site:{domain}', limit=3)
+    return out
+
+
+@st.cache_data(ttl=3600)
+def get_cnn_fear_greed_text():
+    url = 'https://edition-prod-cf.sitemirror.cnn.com/markets/fear-and-greed'
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        text = BeautifulSoup(r.text, 'html.parser').get_text(' ', strip=True)
+        return text, url
+    except Exception:
+        return '', url
+
+
+@st.cache_data(ttl=3600)
+def get_insider_dashboard(ticker):
+    url = f'https://www.insiderdashboard.com/search?query={ticker}'
+    out = {'url': url, 'rows': [], 'summary': 'No public insider transactions parsed.'}
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        text = BeautifulSoup(r.text, 'html.parser').get_text('\n', strip=True)
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        rows = []
+        for i, line in enumerate(lines):
+            if re.fullmatch(r'\d{1,2}/\d{1,2}/\d{4}', line):
+                row = {'date': line, 'type': '', 'shares': '', 'value': ''}
+                window = lines[i:i+10]
+                for w in window:
+                    if 'buy' in w.lower() or 'sell' in w.lower():
+                        row['type'] = w
+                        break
+                nums = [w for w in window if re.search(r'\$[\d,]+', w) or re.fullmatch(r'[\d,]+', w)]
+                if nums:
+                    row['shares'] = nums[0]
+                if len(nums) > 1:
+                    row['value'] = nums[1]
+                rows.append(row)
+        # dedupe by date+type
+        seen = set()
+        clean = []
+        for row in rows:
+            key = (row['date'], row['type'])
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(row)
+        out['rows'] = clean[:8]
+        if clean:
+            last = clean[0]
+            out['summary'] = f"Latest public insider item appears around {last['date']} ({last['type'] or 'filing'}). Use the source link to verify transaction size and direction."
+    except Exception:
+        pass
+    return out
+
+
+# ---------- Summaries ----------
+def summarize_macro(news_bundle, spy_trend, qqq_trend, dxy_trend, teny_trend):
+    lines = []
+    all_titles = []
+    for source, items in news_bundle.items():
+        if items:
+            titles = [x['title'] for x in items[:2]]
+            lines.append(f"{source}: " + ' | '.join(titles))
+            all_titles.extend(titles)
+    base = 5.5
+    if spy_trend == 'Up' and qqq_trend == 'Up':
+        base += 1.0
+    if dxy_trend == 'Down':
+        base += 0.5
+    if teny_trend == 'Down':
+        base += 0.5
+    base += clamp(keyword_score(' '.join(all_titles)) * 0.2, -2, 2)
+    rating, status = rating_to_status(base)
+    summary = short_join([
+        f"SPY {spy_trend}, QQQ {qqq_trend}, DXY {dxy_trend}, 10Y {teny_trend}.",
+        short_join(lines, 3),
+    ], 2)
+    return rating, status, summary, lines
+
+
+def summarize_market_context(ticker, info, news_bundle, yf_news, calendar):
+    lines = []
+    title_bank = []
+    if info.get('shortName'):
+        lines.append(f"{info.get('shortName')} ({ticker}) in {info.get('sector', 'N/A')} / {info.get('industry', 'N/A')}. ")
+    if info.get('currentPrice') and info.get('targetMeanPrice'):
+        lines.append(f"Current price ~{info.get('currentPrice')}, analyst mean target ~{info.get('targetMeanPrice')}.")
+    if safe_float(info.get('revenueGrowth')) == safe_float(info.get('revenueGrowth')):
+        rg = safe_float(info.get('revenueGrowth')) * 100
+        lines.append(f"Revenue growth approx. {rg:.1f}%.")
+    if safe_float(info.get('earningsGrowth')) == safe_float(info.get('earningsGrowth')):
+        eg = safe_float(info.get('earningsGrowth')) * 100
+        lines.append(f"Earnings growth approx. {eg:.1f}%.")
+
+    for _, items in news_bundle.items():
+        for item in items[:2]:
+            title_bank.append(item['title'])
+    for item in (yf_news or [])[:4]:
+        title = item.get('title') or item.get('content', {}).get('title') or ''
+        if title:
+            title_bank.append(title)
+    if title_bank:
+        lines.append('Recent catalysts: ' + ' | '.join(title_bank[:4]))
+
+    upcoming = []
+    try:
+        if calendar is not None and not getattr(calendar, 'empty', True):
+            upcoming.append('Upcoming calendar event detected.')
+    except Exception:
+        pass
+    if upcoming:
+        lines.extend(upcoming)
+
+    base = 5.5 + clamp(keyword_score(' '.join(title_bank)) * 0.25, -3, 3)
+    if safe_float(info.get('revenueGrowth')) > 0:
+        base += 0.5
+    if safe_float(info.get('earningsGrowth')) > 0:
+        base += 0.5
+    rating, status = rating_to_status(base)
+    summary = short_join(lines, 3)
+    return rating, status, summary, title_bank[:6]
+
+
+def technical_pack(df, spy_df, qqq_df, dia_df):
+    close = df['Close']
+    vol = df['Volume']
+    last = float(close.iloc[-1])
+    sma50 = close.rolling(50).mean().iloc[-1]
+    sma200 = close.rolling(200).mean().iloc[-1] if len(df) >= 200 else np.nan
+    avg30 = vol.rolling(30).mean().iloc[-1]
+    rsi14 = rsi(close).iloc[-1]
+    macd_line, macd_signal, _ = macd(close)
+    k, d = stochastic(df)
+    atr14 = atr(df).iloc[-1]
+    _, _, span_a, span_b = ichimoku(df)
+    p, s1, s2, r1, r2 = pivot_levels(df)
+    liquidity_levels = nearest_liquidity_levels(df, last)
+    flow_text, flow_score = price_volume_orderflow_proxy(df)
+    candle = detect_candle(df)
+
+    pack = []
+
+    score = 8 if last > sma50 and (np.isnan(sma200) or last > sma200) else 3 if last < sma50 and (np.isnan(sma200) or last < sma200) else 5
+    pack.append(('SMA 50 / 200', score, f'Price {last:.2f} vs SMA50 {sma50:.2f}' + (f' and SMA200 {sma200:.2f}' if sma200 == sma200 else '')))
+
+    vscore = 7 if vol.iloc[-1] > avg30 * 1.15 else 4 if vol.iloc[-1] < avg30 * 0.85 else 5
+    pack.append(('Volume vs Avg', vscore, f'Latest volume {vol.iloc[-1]:,.0f} vs 30-day avg {avg30:,.0f}.'))
+
+    rscore = 8 if 45 <= rsi14 <= 65 else 3 if rsi14 > 72 or rsi14 < 28 else 5
+    pack.append(('RSI', rscore, f'RSI(14) {rsi14:.2f}.'))
+
+    mscore = 7 if macd_line.iloc[-1] > macd_signal.iloc[-1] else 3
+    pack.append(('MACD', mscore, f'MACD {macd_line.iloc[-1]:.2f} vs signal {macd_signal.iloc[-1]:.2f}.'))
+
+    stoch_last = k.iloc[-1]
+    sscore = 7 if 20 <= stoch_last <= 80 else 4
+    pack.append(('Stochastic', sscore, f'Stoch %K {stoch_last:.2f}, %D {d.iloc[-1]:.2f}.'))
+
+    atr_pct = atr14 / last * 100 if last else np.nan
+    volscore = 7 if atr_pct < 3 else 5 if atr_pct < 5 else 3
+    pack.append(('Volatility (Risk)', volscore, f'ATR(14) ~{atr14:.2f} ({atr_pct:.2f}% of price).'))
+
+    lvscore = 7 if last > p else 4
+    pack.append(('Support / Resistance', lvscore, f'S1 {s1:.2f}, S2 {s2:.2f}, R1 {r1:.2f}, R2 {r2:.2f}.'))
+
+    cloud_top = np.nanmax([span_a.iloc[-1], span_b.iloc[-1]]) if not (np.isnan(span_a.iloc[-1]) and np.isnan(span_b.iloc[-1])) else np.nan
+    cloud_bottom = np.nanmin([span_a.iloc[-1], span_b.iloc[-1]]) if not (np.isnan(span_a.iloc[-1]) and np.isnan(span_b.iloc[-1])) else np.nan
+    if cloud_top == cloud_top:
+        iscore = 8 if last > cloud_top else 3 if last < cloud_bottom else 5
+        idesc = f'Price {last:.2f} vs cloud {cloud_bottom:.2f}-{cloud_top:.2f}.'
+    else:
+        iscore = 5
+        idesc = 'Not enough data for full cloud.'
+    pack.append(('Ichimoku Cloud', iscore, idesc))
+
+    pack.append(('Order Flow (2w proxy)', flow_score, flow_text + ' Proxy derived from signed price/volume, not Level-2 tape.'))
+
+    dol_vol = float((df['Close'].tail(20) * df['Volume'].tail(20)).mean())
+    liqscore = 8 if dol_vol > 5e8 else 6 if dol_vol > 1e8 else 3
+    liqtxt = f'20-day average dollar volume ~${dol_vol/1e6:,.1f}M. Key liquidity nodes: ' + (', '.join(f'{x:.0f}' for x in liquidity_levels) if liquidity_levels else 'not enough data')
+    pack.append(('Liquidity Levels', liqscore, liqtxt))
+
+    cscore = 7 if 'Bullish' in candle or 'Hammer' in candle else 3 if 'Bearish' in candle or 'Shooting' in candle else 5
+    pack.append(('Candle', cscore, candle))
+
+    corr_rows = []
+    follow_score = 5
+    for name, idx_df in [('DJI', dia_df), ('SPY', spy_df), ('QQQ', qqq_df)]:
+        joined = pd.concat([df['Close'].pct_change(), idx_df['Close'].pct_change()], axis=1).dropna().tail(60)
+        if len(joined) > 20:
+            corr = joined.corr().iloc[0, 1]
+            corr_rows.append((name, corr))
+    corr_rows = sorted(corr_rows, key=lambda x: x[1], reverse=True)
+    leader = corr_rows[0][0] if corr_rows else 'N/A'
+    if corr_rows and corr_rows[0][1] > 0.8:
+        follow_score = 7
+    elif corr_rows and corr_rows[0][1] < 0.5:
+        follow_score = 4
+    pack.append(('Follows Which Index?', follow_score, f'Highest 60-day correlation is with {leader}' + (f' ({corr_rows[0][1]:.2f}).' if corr_rows else '.')))
+
+    overall = sum(float(x[1]) for x in pack) / len(pack)
+    summary = f"Technicals are {('constructive' if overall >= 6.5 else 'mixed' if overall >= 4.5 else 'weak')} with strongest signals in {', '.join([x[0] for x in sorted(pack, key=lambda y: y[1], reverse=True)[:2]])}. Main caution comes from {', '.join([x[0] for x in sorted(pack, key=lambda y: y[1])[:2]])}."
+
+    long_entry = min(last, p)
+    stop = s1 if s1 < long_entry else long_entry - atr14
+    target1 = r1
+    target2 = r2
+
+    return pack, overall, summary, {
+        'current': last,
+        's1': s1,
+        's2': s2,
+        'r1': r1,
+        'r2': r2,
+        'entry': long_entry,
+        'stop': stop,
+        'target1': target1,
+        'target2': target2,
+        'rsi': rsi14,
+    }
+
+
+def summarize_sentiment_and_analysts(ticker, info):
+    text, url = get_cnn_fear_greed_text()
+    score = 5.5
+    fg_desc = 'Fear & Greed page unavailable.'
+    if text:
+        m = re.search(r'(Extreme Greed|Greed|Neutral|Fear|Extreme Fear)', text)
+        if m:
+            label = m.group(1)
+            fg_desc = f'CNN Fear & Greed currently reads around {label}.'
+            mapping = {'Extreme Greed': 7, 'Greed': 6, 'Neutral': 5, 'Fear': 4, 'Extreme Fear': 3}
+            score = mapping.get(label, 5)
+    analyst_bits = []
+    if info.get('recommendationKey'):
+        rk = str(info.get('recommendationKey')).title()
+        analyst_bits.append(f'Yahoo analyst key is {rk}.')
+        if rk in ['Buy', 'Strong Buy']:
+            score += 1
+        elif rk in ['Underperform', 'Sell']:
+            score -= 1
+    if info.get('targetMeanPrice') and info.get('currentPrice'):
+        cp = safe_float(info.get('currentPrice'))
+        tp = safe_float(info.get('targetMeanPrice'))
+        if cp == cp and tp == tp and cp > 0:
+            upside = (tp / cp - 1) * 100
+            analyst_bits.append(f'Mean target implies about {upside:.1f}% upside/downside.')
+            if upside > 10:
+                score += 0.5
+            elif upside < -5:
+                score -= 0.5
+    rating, status = rating_to_status(score)
+    summary = short_join([fg_desc] + analyst_bits, 4)
+    return rating, status, summary, url
+
+
+def social_summary(ticker):
+    bundle = get_social_mentions(ticker)
+    lines = []
+    for site, items in bundle.items():
+        if items:
+            titles = '; '.join(x['title'] for x in items[:2])
+            lines.append(f'{site}: {titles}')
+        else:
+            lines.append(f'{site}: no strong indexed discussion found.')
+    return lines[:10], bundle
 
 
 # ---------- UI ----------
-st.title("📈 Ticker Advisor Pro")
-st.caption("Enter only a ticker. The app fetches the data, rates each section 1-10, color-codes the result, summarizes political/economic/news context, and suggests support/resistance-based entries and exits.")
+st.title('📈 Ticker Advisor Pro+')
+st.caption('Ticker in → source-backed summary out. Ratings use Green / Yellow / Red plus 1-10 scores.')
 
-with st.sidebar:
-    st.subheader("Optional upgrade")
-    st.write("The app works with Yahoo Finance and public web sources. Add `FINNHUB_API_KEY` in Streamlit secrets if you want a stronger analyst feed.")
-    st.code('FINNHUB_API_KEY = "your_key_here"', language="toml")
-
-col1, col2 = st.columns([3, 1])
+col1, col2 = st.columns([1, 1])
 with col1:
-    ticker = st.text_input("Ticker", placeholder="AAPL").strip().upper()
+    ticker = st.text_input('Ticker', value='AAPL').upper().strip()
 with col2:
-    analyze = st.button("Analyze", use_container_width=True, type="primary")
+    run = st.button('Analyze', type='primary')
 
-if analyze:
-    try:
-        result = analyze_ticker(ticker)
+if run and ticker:
+    with st.spinner('Pulling market data, headlines, technicals, and insider summaries...'):
+        df = get_history(ticker)
+        spy = get_history('SPY', '1y')
+        qqq = get_history('QQQ', '1y')
+        dia = get_history('DIA', '1y')
+        dxy = get_history('DX-Y.NYB', '6mo')
+        tnx = get_history('^TNX', '6mo')
+        info, yf_news, calendar = get_ticker_data(ticker)
 
-        if result["recommendation"] == "BUY":
-            st.success(f"{result['ticker']}: {result['recommendation']}")
-        elif "SELL" in result["recommendation"]:
-            st.error(f"{result['ticker']}: {result['recommendation']}")
+        if df.empty:
+            st.error('No price history found for that ticker.')
+            st.stop()
+
+        macro_bundle = get_macro_news()
+        ticker_news_bundle = get_ticker_context_news(ticker)
+        insider = get_insider_dashboard(ticker)
+        social_lines, social_bundle = social_summary(ticker)
+
+        spy_tr = trend_of(spy)
+        qqq_tr = trend_of(qqq)
+        dxy_tr = trend_of(dxy)
+        teny_tr = trend_of(tnx)
+
+        macro_rating, macro_status, macro_summary, macro_lines = summarize_macro(macro_bundle, spy_tr, qqq_tr, dxy_tr, teny_tr)
+        mkt_rating, mkt_status, mkt_summary, mkt_titles = summarize_market_context(ticker, info, ticker_news_bundle, yf_news, calendar)
+        tech_rows, tech_overall, tech_summary, levels = technical_pack(df, spy, qqq, dia)
+        tech_rating, tech_status = rating_to_status(tech_overall)
+        sent_rating, sent_status, sent_summary, cnn_url = summarize_sentiment_and_analysts(ticker, info)
+
+        insider_score = 5
+        if insider['rows']:
+            text_blob = ' '.join((x.get('type') or '') for x in insider['rows'])
+            if 'buy' in text_blob.lower() and 'sell' not in text_blob.lower():
+                insider_score = 7
+            elif 'sell' in text_blob.lower() and 'buy' not in text_blob.lower():
+                insider_score = 4
+        insider_rating, insider_status = rating_to_status(insider_score)
+
+        social_score = 5 + clamp(keyword_score(' '.join(social_lines)) * 0.3, -2, 2)
+        social_rating, social_status = rating_to_status(social_score)
+
+        section_df = pd.DataFrame([
+            ['Macro & Political', macro_rating, macro_status, macro_summary],
+            ['Market Context', mkt_rating, mkt_status, mkt_summary],
+            ['Technical Analysis', tech_rating, tech_status, tech_summary],
+            ['Insider / Whale Activity', insider_rating, insider_status, insider['summary']],
+            ['Sentiment & Analysts', sent_rating, sent_status, sent_summary],
+            ['Social Media', social_rating, social_status, short_join(social_lines, 3)],
+        ], columns=['Section', 'Score', 'Status', 'Summary'])
+        total_score = section_df['Score'].sum()
+        threshold = 40
+        if total_score >= 48:
+            final_call = 'BUY bias'
+        elif total_score <= 28:
+            final_call = 'SELL / AVOID bias'
         else:
-            st.warning(f"{result['ticker']}: {result['recommendation']}")
-        st.write(result["recommendation_note"])
+            final_call = 'NO ACTION / WATCH'
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Current Price", f"${result['price']:.2f}")
-        m2.metric("Total Score", f"{result['total_score']:.0f}/{result['max_score']}")
-        m3.metric("Threshold", f"{result['pass_threshold']}/{result['max_score']}")
-        m4.metric("Risk/Reward", f"{result['rr']:.2f}")
+    top1, top2, top3 = st.columns(3)
+    top1.metric('Ticker', ticker)
+    top2.metric('Total Score', f'{int(total_score)}/60')
+    top3.metric('Recommendation', final_call)
 
-        threshold_text = "PASSES" if result["total_score"] >= result["pass_threshold"] else "DOES NOT PASS"
-        st.markdown(
-            f"**Minimum threshold to trade:** {result['total_score']:.0f}/{result['max_score']} — {threshold_text}"
-        )
+    st.subheader('Section Scores')
+    show_df = section_df.copy()
+    show_df['Color'] = show_df['Status'].apply(lambda x: '🟢' if x == 'Green' else '🔴' if x == 'Red' else '🟡')
+    st.dataframe(show_df[['Color', 'Section', 'Score', 'Summary']], use_container_width=True, hide_index=True)
 
-        st.subheader("Section Scores")
-        rows = []
-        for idx, sec in enumerate(result["sections"], start=1):
-            rows.append(
-                {
-                    "#": idx,
-                    "Section": sec["section"],
-                    "Score": f"{sec['score']}/10",
-                    "Signal": sec["color"],
-                    "Key Finding": sec["summary"],
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        for sec in result["sections"]:
-            badge = render_status_badge(sec["color"], f"{sec['emoji']} {sec['color']} · {sec['score']}/10")
-            st.markdown(f"### {sec['section']}  {badge}", unsafe_allow_html=True)
-            st.write(sec["summary"])
-            with st.expander(f"Show {sec['section']} details"):
-                for line in sec["details"]:
-                    st.write(f"- {line}")
-
-        st.subheader("Political & Economic News Summary")
-        news_col1, news_col2 = st.columns(2)
-        with news_col1:
-            st.markdown("#### Political / Geopolitical")
-            macro_sec = next((s for s in result["sections"] if s["section"] == "Macro & Political"), None)
-            if macro_sec:
-                st.markdown(render_status_badge(macro_sec["color"], f"{macro_sec['score']}/10"), unsafe_allow_html=True)
-            if result["political_news"]:
-                for item in result["political_news"][:3]:
-                    st.markdown(f"- [{item['title']}]({item['link']})")
+    c1, c2 = st.columns([1.2, 0.8])
+    with c1:
+        st.subheader('Macro & Political')
+        st.markdown(f"{badge(macro_status)} **{macro_rating}/10** — {macro_summary}", unsafe_allow_html=True)
+        for source, items in macro_bundle.items():
+            st.markdown(f'**{source}**')
+            if items:
+                for it in items[:3]:
+                    st.markdown(f"- [{it['title']}]({it['link']})")
             else:
-                st.write("No political headlines were fetched.")
-        with news_col2:
-            st.markdown("#### Economic / Fed / Macro")
-            if result["economic_news"]:
-                for item in result["economic_news"][:3]:
-                    st.markdown(f"- [{item['title']}]({item['link']})")
-            else:
-                st.write("No economic headlines were fetched.")
+                st.write('- No recent indexed result found.')
 
-        st.subheader("Insider Dashboard Summary")
-        insider = result["insider_dashboard"]
-        insider_color = insider.get("status", "Yellow")
-        st.markdown(render_status_badge(insider_color, insider_color), unsafe_allow_html=True)
-        st.write(insider.get("summary", "No insider summary available."))
-        if insider.get("filings"):
-            for filing in insider["filings"]:
-                st.write(f"- {filing.get('date', '')} {filing.get('form', '')} {filing.get('impact', '')}: {filing.get('summary', '')}")
-        st.markdown(f"[Open Insider Dashboard page]({insider['url']})")
+        st.subheader('Market Context')
+        st.markdown(f"{badge(mkt_status)} **{mkt_rating}/10** — {mkt_summary}", unsafe_allow_html=True)
+        if mkt_titles:
+            for t in mkt_titles[:6]:
+                st.write(f'- {t}')
 
-        st.subheader("Key Levels")
-        levels_df = pd.DataFrame(
-            [
-                ["Current Price", f"${result['price']:.2f}"],
-                ["Intraday Support (S1)", f"${result['support1']:.2f}"],
-                ["Intraday Support (S2)", f"${result['support2']:.2f}"],
-                ["Resistance (R1)", f"${result['resistance1']:.2f}"],
-                ["Resistance (R2)", f"${result['resistance2']:.2f}"],
-                ["Entry Zone", result['entry_zone']],
-                ["Stop Loss", f"${result['stop']:.2f}"],
-                ["Target 1", f"${result['target1']:.2f}"],
-                ["Target 2", f"${result['target2']:.2f}"],
-                ["RSI (14)", f"{result['rsi']:.2f}"],
-                ["Risk/Reward", f"{result['rr']:.2f}"],
-                ["VIX", f"{result['vix']:.2f}" if result['vix'] else "Unavailable"],
-                ["DXY Trend", result['dxy']],
-            ],
-            columns=["Level", "Price / Value"],
-        )
-        st.table(levels_df)
+        st.subheader('Technical Analysis')
+        st.markdown(f"{badge(tech_status)} **{tech_rating}/10** — {tech_summary}", unsafe_allow_html=True)
+        tech_table = []
+        for name, score, desc in tech_rows:
+            r, s = rating_to_status(score)
+            tech_table.append([('🟢' if s=='Green' else '🔴' if s=='Red' else '🟡'), name, f'{r}/10', desc])
+        st.dataframe(pd.DataFrame(tech_table, columns=['Color', 'Indicator', 'Score', 'Reading']), use_container_width=True, hide_index=True)
 
-        st.subheader("Company Headlines")
-        if result["company_news"]:
-            for item in result["company_news"][:5]:
-                if item.get("link"):
-                    st.markdown(f"- [{item['title']}]({item['link']}) — {item['publisher']}")
-                else:
-                    st.write(f"- {item['title']} — {item['publisher']}")
-        else:
-            st.write("No recent company headlines were returned.")
+    with c2:
+        st.subheader('Key Levels')
+        rr = (levels['target2'] - levels['entry']) / max(levels['entry'] - levels['stop'], 0.01)
+        key_levels_df = pd.DataFrame([
+            ['Current Price', f"{levels['current']:.2f}"],
+            ['Support (S1)', f"{levels['s1']:.2f}"],
+            ['Support (S2)', f"{levels['s2']:.2f}"],
+            ['Resistance (R1)', f"{levels['r1']:.2f}"],
+            ['Resistance (R2)', f"{levels['r2']:.2f}"],
+            ['Entry Zone', f"{min(levels['s1'], levels['entry']):.2f} - {levels['entry']:.2f}"],
+            ['Stop Loss', f"{levels['stop']:.2f}"],
+            ['Target 1', f"{levels['target1']:.2f}"],
+            ['Target 2', f"{levels['target2']:.2f}"],
+            ['Risk / Reward', f"~{rr:.2f}:1"],
+        ], columns=['Level', 'Price'])
+        st.dataframe(key_levels_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Price chart")
-        chart_data = get_market_history(result["ticker"], period="6mo")
-        st.line_chart(chart_data["Close"])
+        st.subheader('Insider / Whale Activity')
+        st.markdown(f"{badge(insider_status)} **{insider_rating}/10** — {insider['summary']}", unsafe_allow_html=True)
+        if insider['rows']:
+            rows = []
+            for x in insider['rows'][:8]:
+                rows.append([x.get('date',''), x.get('type',''), x.get('shares',''), x.get('value','')])
+            st.dataframe(pd.DataFrame(rows, columns=['Date', 'Type', 'Quantity', 'Size/Value']), use_container_width=True, hide_index=True)
+        st.markdown(f"[Source link]({insider['url']})")
+        st.caption('Verify each filing on the source page before trading.')
 
-        st.subheader("Source links")
-        for label, url in result["sources"].items():
-            st.markdown(f"- [{label}]({url})")
+        st.subheader('Sentiment & Analysts')
+        st.markdown(f"{badge(sent_status)} **{sent_rating}/10** — {sent_summary}", unsafe_allow_html=True)
+        st.markdown(f"[CNN Fear & Greed]({cnn_url})")
 
-    except Exception as exc:
-        st.error(str(exc))
-else:
-    st.info("Type a ticker and click Analyze.")
+    st.subheader('Social Media')
+    st.markdown(f"{badge(social_status)} **{social_rating}/10**", unsafe_allow_html=True)
+    for line in social_lines[:10]:
+        st.write(f'- {line}')
+
+    with st.expander('Source links used by the app'):
+        st.write('- Macro sources are searched from MarketWatch, CNBC, and Yahoo Finance through indexed news results.')
+        st.write('- Insider source: Insider Dashboard.')
+        st.write('- Sentiment source: CNN Fear & Greed.')
+        st.write('- Market/technical data: Yahoo Finance via yfinance.')
